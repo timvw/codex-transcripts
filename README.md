@@ -138,3 +138,9 @@ And run your local development copy of the tool like this:
 ```bash
 uv run codex-transcripts --help
 ```
+
+## Credits
+
+This project is inspired by and based on Simon Willison's
+[claude-code-transcripts](https://github.com/simonw/claude-code-transcripts).
+See [Simon Willison](https://github.com/simonw) for the original author.

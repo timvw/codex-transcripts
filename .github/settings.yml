@@ -1,0 +1,4 @@
+repository:
+  name: codex-transcripts
+  description: Tools for publishing transcripts for Codex sessions
+  topics: []
