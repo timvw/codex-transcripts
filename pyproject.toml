@@ -1,6 +1,6 @@
 [project]
 name = "codex-transcripts"
-version = "0.1.0"
+version = "0.1.1"
 description = "Convert Codex session files to HTML transcripts"
 readme = "README.md"
 license = "Apache-2.0"
