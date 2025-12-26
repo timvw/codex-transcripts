@@ -400,6 +400,7 @@ def normalize_rollout_entries(entries):
 
 def detect_github_repo(messages):
     """Detect GitHub repo from git push output in tool results."""
+    detected = None
     for message in messages:
         for block in message.get("content", []):
             if block.get("type") == "tool_result":
@@ -407,11 +408,12 @@ def detect_github_repo(messages):
                 if isinstance(content, str):
                     match = GITHUB_REPO_PATTERN.search(content)
                     if match:
-                        return match.group(1)
+                        detected = match.group(1)
+                        continue
                     repo = parse_repo_from_url(content)
                     if repo:
-                        return repo
-    return None
+                        detected = repo
+    return detected
 
 
 def parse_repo_from_url(text):
@@ -419,7 +421,10 @@ def parse_repo_from_url(text):
         return None
     match = REPO_URL_PATTERN.search(text)
     if match:
-        return match.group(1)
+        repo = match.group(1)
+        if repo.endswith(".git"):
+            repo = repo[: -len(".git")]
+        return repo
     return None
 
 
@@ -938,7 +943,9 @@ def generate_html(json_path, output_dir, github_repo=None):
     messages = normalize_rollout_entries(entries)
 
     if github_repo is None:
-        github_repo = extract_repo_from_entries(entries) or detect_github_repo(messages)
+        repo_from_entries = extract_repo_from_entries(entries)
+        repo_from_messages = detect_github_repo(messages)
+        github_repo = repo_from_messages or repo_from_entries
         if github_repo:
             print(f"Auto-detected GitHub repo: {github_repo}")
         else:

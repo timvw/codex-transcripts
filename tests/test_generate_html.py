@@ -138,3 +138,28 @@ class TestRepoDetect:
     def test_extract_repo_from_entries(self, sample_session_path):
         entries = parse_session_file(sample_session_path)
         assert extract_repo_from_entries(entries) == "example/project"
+
+    def test_detect_github_repo_prefers_latest(self):
+        messages = [
+            {
+                "role": "assistant",
+                "timestamp": "2025-12-24T10:00:06.000Z",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "origin\tgit@github.com:simonw/claude-code-transcripts.git",
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2025-12-24T10:00:10.000Z",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "To github.com:timvw/codex-transcripts.git",
+                    }
+                ],
+            },
+        ]
+        assert detect_github_repo(messages) == "timvw/codex-transcripts"
