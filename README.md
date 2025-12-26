@@ -39,7 +39,7 @@ All commands support these options:
 
 - `-o, --output DIRECTORY` - output directory (default: writes to temp dir and opens browser)
 - `-a, --output-auto` - auto-name output subdirectory based on session filename
-- `--repo OWNER/NAME` - GitHub repo for commit links (auto-detected from git output if not specified)
+- `--repo OWNER/NAME` - GitHub repo for commit links (auto-detected from session metadata or git output if not specified)
 - `--open` - open the generated `index.html` in your default browser (default if no `-o` specified)
 - `--gist` - upload the generated HTML files to a GitHub Gist and output a preview URL
 - `--json` - include the original session file in the output directory

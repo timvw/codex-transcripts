@@ -38,6 +38,9 @@ COMMIT_PATTERN = re.compile(r"\[[\w\-/]+ ([a-f0-9]{7,})\] (.+?)(?:\n|$)")
 GITHUB_REPO_PATTERN = re.compile(
     r"github\.com/([a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+)/pull/new/"
 )
+REPO_URL_PATTERN = re.compile(
+    r"(?:github\.com[:/])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\\.git)?(?:/|$)"
+)
 
 PROMPTS_PER_PAGE = 5
 LONG_TEXT_THRESHOLD = 300  # Characters - text blocks longer than this are shown in index
@@ -405,6 +408,31 @@ def detect_github_repo(messages):
                     match = GITHUB_REPO_PATTERN.search(content)
                     if match:
                         return match.group(1)
+                    repo = parse_repo_from_url(content)
+                    if repo:
+                        return repo
+    return None
+
+
+def parse_repo_from_url(text):
+    if not text or not isinstance(text, str):
+        return None
+    match = REPO_URL_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def extract_repo_from_entries(entries):
+    for entry in entries:
+        if entry.get("type") != "session_meta":
+            continue
+        payload = entry.get("payload", {})
+        git = payload.get("git") or {}
+        repo_url = git.get("repository_url")
+        repo = parse_repo_from_url(repo_url)
+        if repo:
+            return repo
     return None
 
 
@@ -910,7 +938,7 @@ def generate_html(json_path, output_dir, github_repo=None):
     messages = normalize_rollout_entries(entries)
 
     if github_repo is None:
-        github_repo = detect_github_repo(messages)
+        github_repo = extract_repo_from_entries(entries) or detect_github_repo(messages)
         if github_repo:
             print(f"Auto-detected GitHub repo: {github_repo}")
         else:

@@ -8,6 +8,7 @@ import pytest
 from codex_transcripts import (
     analyze_conversation,
     detect_github_repo,
+    extract_repo_from_entries,
     format_json,
     format_tool_stats,
     generate_html,
@@ -133,3 +134,7 @@ class TestRepoDetect:
             }
         ]
         assert detect_github_repo(messages) == "example/project"
+
+    def test_extract_repo_from_entries(self, sample_session_path):
+        entries = parse_session_file(sample_session_path)
+        assert extract_repo_from_entries(entries) == "example/project"
