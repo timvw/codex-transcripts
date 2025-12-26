@@ -1,6 +1,7 @@
 # codex-transcripts
 
 [![Tests](https://github.com/timvw/codex-transcripts/actions/workflows/test.yml/badge.svg)](https://github.com/timvw/codex-transcripts/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/codex-transcripts.svg)](https://pypi.org/project/codex-transcripts/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/timvw/codex-transcripts/blob/main/LICENSE)
 
 Convert Codex session rollouts (JSONL) into clean, mobile-friendly HTML transcripts with pagination.
