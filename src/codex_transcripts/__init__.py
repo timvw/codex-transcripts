@@ -1,9 +1,7 @@
-"""Convert Claude Code session JSON to a clean mobile-friendly HTML page with pagination."""
+"""Convert Codex session JSONL to clean mobile-friendly HTML pages with pagination."""
 
-import json
 import html
-import os
-import platform
+import json
 import re
 import shutil
 import subprocess
@@ -13,14 +11,13 @@ from pathlib import Path
 
 import click
 from click_default_group import DefaultGroup
-import httpx
 from jinja2 import Environment, PackageLoader
 import markdown
 import questionary
 
 # Set up Jinja2 environment
 _jinja_env = Environment(
-    loader=PackageLoader("claude_code_transcripts", "templates"),
+    loader=PackageLoader("codex_transcripts", "templates"),
     autoescape=True,
 )
 
@@ -43,111 +40,57 @@ GITHUB_REPO_PATTERN = re.compile(
 )
 
 PROMPTS_PER_PAGE = 5
-LONG_TEXT_THRESHOLD = (
-    300  # Characters - text blocks longer than this are shown in index
-)
+LONG_TEXT_THRESHOLD = 300  # Characters - text blocks longer than this are shown in index
 
 # Module-level variable for GitHub repo (set by generate_html)
 _github_repo = None
 
-# API constants
-API_BASE_URL = "https://api.anthropic.com/v1"
-ANTHROPIC_VERSION = "2023-06-01"
-
 
 def get_session_summary(filepath, max_length=200):
-    """Extract a human-readable summary from a session file.
-
-    Supports both JSON and JSONL formats.
-    Returns a summary string or "(no summary)" if none found.
-    """
+    """Extract a human-readable summary from a Codex session file."""
     filepath = Path(filepath)
     try:
-        if filepath.suffix == ".jsonl":
-            return _get_jsonl_summary(filepath, max_length)
-        else:
-            # For JSON files, try to get first user message
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            loglines = data.get("loglines", [])
-            for entry in loglines:
-                if entry.get("type") == "user":
-                    msg = entry.get("message", {})
-                    content = msg.get("content", "")
-                    if isinstance(content, str) and content.strip():
-                        if len(content) > max_length:
-                            return content[: max_length - 3] + "..."
-                        return content
-            return "(no summary)"
+        entries = parse_session_file(filepath)
+        for entry in entries:
+            if entry.get("type") == "event_msg":
+                payload = entry.get("payload", {})
+                if payload.get("type") == "user_message":
+                    summary = payload.get("message", "")
+                    return _truncate_summary(summary, max_length)
+            if entry.get("type") == "response_item":
+                payload = entry.get("payload", {})
+                if (
+                    payload.get("type") == "message"
+                    and payload.get("role") == "user"
+                    and payload.get("content")
+                ):
+                    text = _content_items_to_text(payload.get("content", []))
+                    return _truncate_summary(text, max_length)
+        return "(no summary)"
     except Exception:
         return "(no summary)"
 
 
-def _get_jsonl_summary(filepath, max_length=200):
-    """Extract summary from JSONL file."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    # First priority: summary type entries
-                    if obj.get("type") == "summary" and obj.get("summary"):
-                        summary = obj["summary"]
-                        if len(summary) > max_length:
-                            return summary[: max_length - 3] + "..."
-                        return summary
-                except json.JSONDecodeError:
-                    continue
-
-        # Second pass: find first non-meta user message
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if (
-                        obj.get("type") == "user"
-                        and not obj.get("isMeta")
-                        and obj.get("message", {}).get("content")
-                    ):
-                        content = obj["message"]["content"]
-                        if isinstance(content, str):
-                            content = content.strip()
-                            if content and not content.startswith("<"):
-                                if len(content) > max_length:
-                                    return content[: max_length - 3] + "..."
-                                return content
-                except json.JSONDecodeError:
-                    continue
-    except Exception:
-        pass
-
-    return "(no summary)"
+def _truncate_summary(text, max_length):
+    text = (text or "").strip()
+    if not text:
+        return "(no summary)"
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
 
 
 def find_local_sessions(folder, limit=10):
-    """Find recent JSONL session files in the given folder.
-
-    Returns a list of (Path, summary) tuples sorted by modification time.
-    Excludes agent files and warmup/empty sessions.
-    """
+    """Find recent Codex JSONL session files in the given folder."""
     folder = Path(folder)
     if not folder.exists():
         return []
 
     results = []
-    for f in folder.glob("**/*.jsonl"):
-        if f.name.startswith("agent-"):
+    for f in folder.rglob("*.jsonl"):
+        if not f.name.startswith("rollout-"):
             continue
         summary = get_session_summary(f)
-        # Skip boring/empty sessions
-        if summary.lower() == "warmup" or summary == "(no summary)":
-            continue
         results.append((f, summary))
 
     # Sort by modification time, most recent first
@@ -156,171 +99,310 @@ def find_local_sessions(folder, limit=10):
 
 
 def parse_session_file(filepath):
-    """Parse a session file and return normalized data.
-
-    Supports both JSON and JSONL formats.
-    Returns a dict with 'loglines' key containing the normalized entries.
-    """
+    """Parse a Codex session file and return a list of rollout line dicts."""
     filepath = Path(filepath)
-
     if filepath.suffix == ".jsonl":
         return _parse_jsonl_file(filepath)
-    else:
-        # Standard JSON format
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if "entries" in data and isinstance(data["entries"], list):
+            return data["entries"]
+        if "loglines" in data and isinstance(data["loglines"], list):
+            return data["loglines"]
+    return []
 
 
 def _parse_jsonl_file(filepath):
-    """Parse JSONL file and convert to standard format."""
-    loglines = []
-
+    entries = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                obj = json.loads(line)
-                entry_type = obj.get("type")
-
-                # Skip non-message entries
-                if entry_type not in ("user", "assistant"):
-                    continue
-
-                # Convert to standard format
-                entry = {
-                    "type": entry_type,
-                    "timestamp": obj.get("timestamp", ""),
-                    "message": obj.get("message", {}),
-                }
-
-                # Preserve isCompactSummary if present
-                if obj.get("isCompactSummary"):
-                    entry["isCompactSummary"] = True
-
-                loglines.append(entry)
+                entries.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-
-    return {"loglines": loglines}
-
-
-class CredentialsError(Exception):
-    """Raised when credentials cannot be obtained."""
-
-    pass
+    return entries
 
 
-def get_access_token_from_keychain():
-    """Get access token from macOS keychain.
-
-    Returns the access token or None if not found.
-    Raises CredentialsError with helpful message on failure.
-    """
-    if platform.system() != "Darwin":
-        return None
-
-    try:
-        result = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-a",
-                os.environ.get("USER", ""),
-                "-s",
-                "Claude Code-credentials",
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return None
-
-        # Parse the JSON to get the access token
-        creds = json.loads(result.stdout.strip())
-        return creds.get("claudeAiOauth", {}).get("accessToken")
-    except (json.JSONDecodeError, subprocess.SubprocessError):
-        return None
+def _content_items_to_text(items):
+    parts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("output_text", "input_text", "text"):
+            text = item.get("text", "")
+            if text:
+                parts.append(text)
+        elif item.get("type") == "input_image":
+            url = item.get("image_url")
+            if url:
+                parts.append(f"![image]({url})")
+    return "\n".join(parts)
 
 
-def get_org_uuid_from_config():
-    """Get organization UUID from ~/.claude.json.
+def _content_items_to_blocks(items):
+    blocks = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in ("output_text", "input_text", "text"):
+            text = item.get("text", "")
+            if text:
+                blocks.append({"type": "text", "text": text})
+        elif item_type == "input_image":
+            url = item.get("image_url")
+            if url:
+                blocks.append({"type": "text", "text": f"![image]({url})"})
+    return blocks
 
-    Returns the organization UUID or None if not found.
-    """
-    config_path = Path.home() / ".claude.json"
-    if not config_path.exists():
-        return None
 
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-        return config.get("oauthAccount", {}).get("organizationUuid")
-    except (json.JSONDecodeError, IOError):
-        return None
-
-
-def get_api_headers(token, org_uuid):
-    """Build API request headers."""
+def _tool_use_block(name, tool_input, tool_id=None):
+    if not isinstance(tool_input, dict):
+        tool_input = {"value": tool_input}
     return {
-        "Authorization": f"Bearer {token}",
-        "anthropic-version": ANTHROPIC_VERSION,
-        "Content-Type": "application/json",
-        "x-organization-uuid": org_uuid,
+        "type": "tool_use",
+        "name": name,
+        "input": tool_input or {},
+        "id": tool_id or "",
     }
 
 
-def fetch_sessions(token, org_uuid):
-    """Fetch list of sessions from the API.
-
-    Returns the sessions data as a dict.
-    Raises httpx.HTTPError on network/API errors.
-    """
-    headers = get_api_headers(token, org_uuid)
-    response = httpx.get(f"{API_BASE_URL}/sessions", headers=headers, timeout=30.0)
-    response.raise_for_status()
-    return response.json()
+def _tool_result_block(content, is_error=False):
+    return {
+        "type": "tool_result",
+        "content": content,
+        "is_error": is_error,
+    }
 
 
-def fetch_session(token, org_uuid, session_id):
-    """Fetch a specific session from the API.
+def _normalize_event_message(payload, timestamp):
+    event_type = payload.get("type")
+    if event_type == "user_message":
+        message = payload.get("message", "")
+        blocks = [{"type": "text", "text": message}] if message else []
+        images = payload.get("images") or []
+        for url in images:
+            blocks.append({"type": "text", "text": f"![image]({url})"})
+        return {
+            "role": "user",
+            "timestamp": timestamp,
+            "content": blocks,
+        }
+    if event_type == "agent_message":
+        message = payload.get("message", "")
+        return {
+            "role": "assistant",
+            "timestamp": timestamp,
+            "content": [{"type": "text", "text": message}] if message else [],
+        }
+    if event_type in ("agent_reasoning", "agent_reasoning_raw_content"):
+        text = payload.get("text", "")
+        return {
+            "role": "assistant",
+            "timestamp": timestamp,
+            "content": [{"type": "thinking", "thinking": text}] if text else [],
+        }
+    return None
 
-    Returns the session data as a dict.
-    Raises httpx.HTTPError on network/API errors.
-    """
-    headers = get_api_headers(token, org_uuid)
-    response = httpx.get(
-        f"{API_BASE_URL}/session_ingress/session/{session_id}",
-        headers=headers,
-        timeout=60.0,
-    )
-    response.raise_for_status()
-    return response.json()
+
+def _parse_json_maybe(value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    if (text.startswith("{") and text.endswith("}")) or (
+        text.startswith("[") and text.endswith("]")
+    ):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return value
+    return value
 
 
-def detect_github_repo(loglines):
-    """
-    Detect GitHub repo from git push output in tool results.
-
-    Looks for patterns like:
-    - github.com/owner/repo/pull/new/branch (from git push messages)
-
-    Returns the first detected repo (owner/name) or None.
-    """
-    for entry in loglines:
-        message = entry.get("message", {})
-        content = message.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
+def _normalize_response_item(payload, timestamp, include_messages):
+    item_type = payload.get("type")
+    if item_type == "message":
+        if not include_messages:
+            return []
+        role = payload.get("role", "assistant")
+        blocks = _content_items_to_blocks(payload.get("content", []))
+        return [
+            {
+                "role": role,
+                "timestamp": timestamp,
+                "content": blocks,
+            }
+        ]
+    if item_type == "reasoning":
+        parts = []
+        for summary in payload.get("summary", []) or []:
+            if isinstance(summary, dict) and summary.get("type") == "summary_text":
+                text = summary.get("text", "")
+                if text:
+                    parts.append(text)
+        for content in payload.get("content", []) or []:
+            if not isinstance(content, dict):
                 continue
+            ctype = content.get("type")
+            if ctype in ("reasoning_text", "text"):
+                text = content.get("text", "")
+                if text:
+                    parts.append(text)
+        if not parts:
+            return []
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [{"type": "thinking", "thinking": "\n\n".join(parts)}],
+            }
+        ]
+    if item_type == "local_shell_call":
+        action = payload.get("action", {})
+        command = " ".join(action.get("command", []) or [])
+        tool_input = {
+            "command": command,
+            "description": "Local shell",
+            "status": payload.get("status"),
+            "working_directory": action.get("working_directory"),
+            "timeout_ms": action.get("timeout_ms"),
+            "env": action.get("env"),
+        }
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [_tool_use_block("Bash", tool_input, payload.get("call_id"))],
+            }
+        ]
+    if item_type == "function_call":
+        tool_input = _parse_json_maybe(payload.get("arguments", ""))
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [
+                    _tool_use_block(payload.get("name", "Function"), tool_input, payload.get("call_id"))
+                ],
+            }
+        ]
+    if item_type == "custom_tool_call":
+        tool_input = _parse_json_maybe(payload.get("input", ""))
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [
+                    _tool_use_block(payload.get("name", "Tool"), tool_input, payload.get("call_id"))
+                ],
+            }
+        ]
+    if item_type == "function_call_output":
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [_tool_result_block(payload.get("output"))],
+            }
+        ]
+    if item_type == "custom_tool_call_output":
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [_tool_result_block(payload.get("output"))],
+            }
+        ]
+    if item_type == "web_search_call":
+        action = payload.get("action", {})
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [_tool_use_block("web_search", action, payload.get("call_id"))],
+            }
+        ]
+    if item_type == "compaction":
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Context compacted.",
+                    }
+                ],
+            }
+        ]
+    if item_type == "ghost_snapshot":
+        return [
+            {
+                "role": "assistant",
+                "timestamp": timestamp,
+                "content": [_tool_result_block(payload)],
+            }
+        ]
+    return []
+
+
+def normalize_rollout_entries(entries):
+    """Convert raw rollout entries into message dicts."""
+    has_event_messages = any(
+        entry.get("type") == "event_msg"
+        and entry.get("payload", {}).get("type")
+        in ("user_message", "agent_message", "agent_reasoning", "agent_reasoning_raw_content")
+        for entry in entries
+    )
+
+    messages = []
+    for entry in entries:
+        item_type = entry.get("type")
+        payload = entry.get("payload", {})
+        timestamp = entry.get("timestamp", "")
+
+        if item_type == "event_msg":
+            msg = _normalize_event_message(payload, timestamp)
+            if msg and msg.get("content"):
+                messages.append(msg)
+            continue
+
+        if item_type == "compacted":
+            message = payload.get("message", "")
+            if message:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "timestamp": timestamp,
+                        "content": [{"type": "thinking", "thinking": message}],
+                        "is_preface": True,
+                    }
+                )
+            continue
+
+        if item_type == "response_item":
+            messages.extend(_normalize_response_item(payload, timestamp, not has_event_messages))
+            continue
+
+    return messages
+
+
+def detect_github_repo(messages):
+    """Detect GitHub repo from git push output in tool results."""
+    for message in messages:
+        for block in message.get("content", []):
             if block.get("type") == "tool_result":
-                result_content = block.get("content", "")
-                if isinstance(result_content, str):
-                    match = GITHUB_REPO_PATTERN.search(result_content)
+                content = block.get("content", "")
+                if isinstance(content, str):
+                    match = GITHUB_REPO_PATTERN.search(content)
                     if match:
                         return match.group(1)
     return None
@@ -388,10 +470,10 @@ def render_content_block(block):
     if block_type == "thinking":
         content_html = render_markdown_text(block.get("thinking", ""))
         return _macros.thinking(content_html)
-    elif block_type == "text":
+    if block_type == "text":
         content_html = render_markdown_text(block.get("text", ""))
         return _macros.assistant_text(content_html)
-    elif block_type == "tool_use":
+    if block_type == "tool_use":
         tool_name = block.get("name", "Unknown tool")
         tool_input = block.get("input", {})
         tool_id = block.get("id", "")
@@ -407,7 +489,7 @@ def render_content_block(block):
         display_input = {k: v for k, v in tool_input.items() if k != "description"}
         input_json = json.dumps(display_input, indent=2, ensure_ascii=False)
         return _macros.tool_use(tool_name, description, input_json, tool_id)
-    elif block_type == "tool_result":
+    if block_type == "tool_result":
         content = block.get("content", "")
         is_error = block.get("is_error", False)
 
@@ -415,23 +497,18 @@ def render_content_block(block):
         if isinstance(content, str):
             commits_found = list(COMMIT_PATTERN.finditer(content))
             if commits_found:
-                # Build commit cards + remaining content
                 parts = []
                 last_end = 0
                 for match in commits_found:
-                    # Add any content before this commit
-                    before = content[last_end : match.start()].strip()
+                    before = content[last_end: match.start()].strip()
                     if before:
                         parts.append(f"<pre>{html.escape(before)}</pre>")
 
                     commit_hash = match.group(1)
                     commit_msg = match.group(2)
-                    parts.append(
-                        _macros.commit_card(commit_hash, commit_msg, _github_repo)
-                    )
+                    parts.append(_macros.commit_card(commit_hash, commit_msg, _github_repo))
                     last_end = match.end()
 
-                # Add any remaining content after last commit
                 after = content[last_end:].strip()
                 if after:
                     parts.append(f"<pre>{html.escape(after)}</pre>")
@@ -444,26 +521,48 @@ def render_content_block(block):
         else:
             content_html = format_json(content)
         return _macros.tool_result(content_html, is_error)
-    else:
-        return format_json(block)
+
+    return format_json(block)
 
 
-def render_user_message_content(message_data):
-    content = message_data.get("content", "")
-    if isinstance(content, str):
-        if is_json_like(content):
-            return _macros.user_content(format_json(content))
-        return _macros.user_content(render_markdown_text(content))
-    elif isinstance(content, list):
-        return "".join(render_content_block(block) for block in content)
-    return f"<p>{html.escape(str(content))}</p>"
-
-
-def render_assistant_message(message_data):
+def is_tool_result_message(message_data):
+    """Check if a message contains only tool_result blocks."""
     content = message_data.get("content", [])
     if not isinstance(content, list):
-        return f"<p>{html.escape(str(content))}</p>"
-    return "".join(render_content_block(block) for block in content)
+        return False
+    if not content:
+        return False
+    return all(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+    )
+
+
+def _render_block_for_role(block, role):
+    if role == "user" and isinstance(block, dict) and block.get("type") == "text":
+        content_html = render_markdown_text(block.get("text", ""))
+        return _macros.user_content(content_html)
+    return render_content_block(block)
+
+
+def render_message(message):
+    role = message.get("role", "assistant")
+    content_html = "".join(
+        _render_block_for_role(block, role) for block in message.get("content", [])
+    )
+    if not content_html.strip():
+        return ""
+    timestamp = message.get("timestamp", "")
+    msg_id = make_msg_id(timestamp) if timestamp else ""
+
+    if role == "user":
+        role_class, role_label = "user", "User"
+    else:
+        role_class, role_label = "assistant", "Assistant"
+
+    if is_tool_result_message(message):
+        role_class, role_label = "tool-reply", "Tool reply"
+
+    return _macros.message(role_class, role_label, msg_id, timestamp, content_html)
 
 
 def make_msg_id(timestamp):
@@ -472,23 +571,12 @@ def make_msg_id(timestamp):
 
 def analyze_conversation(messages):
     """Analyze messages in a conversation to extract stats and long texts."""
-    tool_counts = {}  # tool_name -> count
+    tool_counts = {}
     long_texts = []
-    commits = []  # list of (hash, message, timestamp)
+    commits = []
 
-    for log_type, message_json, timestamp in messages:
-        if not message_json:
-            continue
-        try:
-            message_data = json.loads(message_json)
-        except json.JSONDecodeError:
-            continue
-
-        content = message_data.get("content", [])
-        if not isinstance(content, list):
-            continue
-
-        for block in content:
+    for message in messages:
+        for block in message.get("content", []):
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type", "")
@@ -497,11 +585,10 @@ def analyze_conversation(messages):
                 tool_name = block.get("name", "Unknown")
                 tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
             elif block_type == "tool_result":
-                # Check for git commit output
                 result_content = block.get("content", "")
                 if isinstance(result_content, str):
                     for match in COMMIT_PATTERN.finditer(result_content):
-                        commits.append((match.group(1), match.group(2), timestamp))
+                        commits.append((match.group(1), match.group(2), message.get("timestamp", "")))
             elif block_type == "text":
                 text = block.get("text", "")
                 if len(text) >= LONG_TEXT_THRESHOLD:
@@ -519,7 +606,6 @@ def format_tool_stats(tool_counts):
     if not tool_counts:
         return ""
 
-    # Abbreviate common tool names
     abbrev = {
         "Bash": "bash",
         "Read": "read",
@@ -539,44 +625,6 @@ def format_tool_stats(tool_counts):
         parts.append(f"{count} {short_name}")
 
     return " · ".join(parts)
-
-
-def is_tool_result_message(message_data):
-    """Check if a message contains only tool_result blocks."""
-    content = message_data.get("content", [])
-    if not isinstance(content, list):
-        return False
-    if not content:
-        return False
-    return all(
-        isinstance(block, dict) and block.get("type") == "tool_result"
-        for block in content
-    )
-
-
-def render_message(log_type, message_json, timestamp):
-    if not message_json:
-        return ""
-    try:
-        message_data = json.loads(message_json)
-    except json.JSONDecodeError:
-        return ""
-    if log_type == "user":
-        content_html = render_user_message_content(message_data)
-        # Check if this is a tool result message
-        if is_tool_result_message(message_data):
-            role_class, role_label = "tool-reply", "Tool reply"
-        else:
-            role_class, role_label = "user", "User"
-    elif log_type == "assistant":
-        content_html = render_assistant_message(message_data)
-        role_class, role_label = "assistant", "Assistant"
-    else:
-        return ""
-    if not content_html.strip():
-        return ""
-    msg_id = make_msg_id(timestamp)
-    return _macros.message(role_class, role_label, msg_id, timestamp, content_html)
 
 
 CSS = """
@@ -712,7 +760,7 @@ document.querySelectorAll('pre.json').forEach(function(el) {
     let text = el.textContent;
     text = text.replace(/"([^"]+)":/g, '<span style="color: #ce93d8">"$1"</span>:');
     text = text.replace(/: "([^"]*)"/g, ': <span style="color: #81d4fa">"$1"</span>');
-    text = text.replace(/: (\\d+)/g, ': <span style="color: #ffcc80">$1</span>');
+    text = text.replace(/: (\d+)/g, ': <span style="color: #ffcc80">$1</span>');
     text = text.replace(/: (true|false|null)/g, ': <span style="color: #f48fb1">$1</span>');
     el.innerHTML = text;
 });
@@ -756,7 +804,6 @@ def inject_gist_preview_js(output_dir):
     output_dir = Path(output_dir)
     for html_file in output_dir.glob("*.html"):
         content = html_file.read_text(encoding="utf-8")
-        # Insert the gist preview JS before the closing </body> tag
         if "</body>" in content:
             content = content.replace(
                 "</body>", f"<script>{GIST_PREVIEW_JS}</script>\n</body>"
@@ -765,17 +812,12 @@ def inject_gist_preview_js(output_dir):
 
 
 def create_gist(output_dir, public=False):
-    """Create a GitHub gist from the HTML files in output_dir.
-
-    Returns the gist ID on success, or raises click.ClickException on failure.
-    """
+    """Create a GitHub gist from the HTML files in output_dir."""
     output_dir = Path(output_dir)
     html_files = list(output_dir.glob("*.html"))
     if not html_files:
         raise click.ClickException("No HTML files found to upload to gist.")
 
-    # Build the gh gist create command
-    # gh gist create file1 file2 ... --public/--private
     cmd = ["gh", "gist", "create"]
     cmd.extend(str(f) for f in sorted(html_files))
     if public:
@@ -788,9 +830,7 @@ def create_gist(output_dir, public=False):
             text=True,
             check=True,
         )
-        # Output is the gist URL, e.g., https://gist.github.com/username/GIST_ID
         gist_url = result.stdout.strip()
-        # Extract gist ID from URL
         gist_id = gist_url.rstrip("/").split("/")[-1]
         return gist_id, gist_url
     except subprocess.CalledProcessError as e:
@@ -807,22 +847,70 @@ def generate_pagination_html(current_page, total_pages):
 
 
 def generate_index_pagination_html(total_pages):
-    """Generate pagination for index page where Index is current (first page)."""
     return _macros.index_pagination(total_pages)
+
+
+def _group_conversations(messages):
+    conversations = []
+    current_conv = None
+    preface = []
+
+    for msg in messages:
+        if msg.get("role") == "user":
+            if current_conv:
+                conversations.append(current_conv)
+            current_conv = {
+                "user_text": _extract_user_text(msg),
+                "timestamp": msg.get("timestamp", ""),
+                "messages": [],
+                "has_preface": False,
+                "is_continuation": False,
+            }
+            if preface:
+                current_conv["messages"].extend(preface)
+                current_conv["has_preface"] = True
+                preface = []
+            current_conv["messages"].append(msg)
+        else:
+            if current_conv:
+                current_conv["messages"].append(msg)
+            else:
+                preface.append(msg)
+
+    if current_conv:
+        conversations.append(current_conv)
+    elif preface:
+        conversations.append(
+            {
+                "user_text": "(no user prompt)",
+                "timestamp": preface[0].get("timestamp", ""),
+                "messages": preface,
+                "has_preface": False,
+                "is_continuation": True,
+            }
+        )
+
+    return conversations
+
+
+def _extract_user_text(message):
+    for block in message.get("content", []):
+        if block.get("type") == "text":
+            text = block.get("text", "").strip()
+            if text:
+                return text
+    return "(no text)"
 
 
 def generate_html(json_path, output_dir, github_repo=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
-    # Load session file (supports both JSON and JSONL)
-    data = parse_session_file(json_path)
+    entries = parse_session_file(json_path)
+    messages = normalize_rollout_entries(entries)
 
-    loglines = data.get("loglines", [])
-
-    # Auto-detect GitHub repo if not provided
     if github_repo is None:
-        github_repo = detect_github_repo(loglines)
+        github_repo = detect_github_repo(messages)
         if github_repo:
             print(f"Auto-detected GitHub repo: {github_repo}")
         else:
@@ -830,41 +918,10 @@ def generate_html(json_path, output_dir, github_repo=None):
                 "Warning: Could not auto-detect GitHub repo. Commit links will be disabled."
             )
 
-    # Set module-level variable for render functions
     global _github_repo
     _github_repo = github_repo
 
-    conversations = []
-    current_conv = None
-    for entry in loglines:
-        log_type = entry.get("type")
-        timestamp = entry.get("timestamp", "")
-        is_compact_summary = entry.get("isCompactSummary", False)
-        message_data = entry.get("message", {})
-        if not message_data:
-            continue
-        # Convert message dict to JSON string for compatibility with existing render functions
-        message_json = json.dumps(message_data)
-        is_user_prompt = False
-        user_text = None
-        if log_type == "user":
-            content = message_data.get("content", "")
-            if isinstance(content, str) and content.strip():
-                is_user_prompt = True
-                user_text = content
-        if is_user_prompt:
-            if current_conv:
-                conversations.append(current_conv)
-            current_conv = {
-                "user_text": user_text,
-                "timestamp": timestamp,
-                "messages": [(log_type, message_json, timestamp)],
-                "is_continuation": bool(is_compact_summary),
-            }
-        elif current_conv:
-            current_conv["messages"].append((log_type, message_json, timestamp))
-    if current_conv:
-        conversations.append(current_conv)
+    conversations = _group_conversations(messages)
 
     total_convs = len(conversations)
     total_pages = (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE
@@ -876,12 +933,14 @@ def generate_html(json_path, output_dir, github_repo=None):
         messages_html = []
         for conv in page_convs:
             is_first = True
-            for log_type, message_json, timestamp in conv["messages"]:
-                msg_html = render_message(log_type, message_json, timestamp)
+            for message in conv["messages"]:
+                msg_html = render_message(message)
                 if msg_html:
-                    # Wrap continuation summaries in collapsed details
-                    if is_first and conv.get("is_continuation"):
-                        msg_html = f'<details class="continuation"><summary>Session continuation summary</summary>{msg_html}</details>'
+                    if is_first and conv.get("has_preface"):
+                        msg_html = (
+                            "<details class=\"continuation\"><summary>Session preface</summary>"
+                            f"{msg_html}</details>"
+                        )
                     messages_html.append(msg_html)
                 is_first = False
         pagination_html = generate_pagination_html(page_num, total_pages)
@@ -899,10 +958,9 @@ def generate_html(json_path, output_dir, github_repo=None):
         )
         print(f"Generated page-{page_num:03d}.html")
 
-    # Calculate overall stats and collect all commits for timeline
     total_tool_counts = {}
     total_messages = 0
-    all_commits = []  # (timestamp, hash, message, page_num, conv_index)
+    all_commits = []
     for i, conv in enumerate(conversations):
         total_messages += len(conv["messages"])
         stats = analyze_conversation(conv["messages"])
@@ -914,15 +972,11 @@ def generate_html(json_path, output_dir, github_repo=None):
     total_tool_calls = sum(total_tool_counts.values())
     total_commits = len(all_commits)
 
-    # Build timeline items: prompts and commits merged by timestamp
     timeline_items = []
 
-    # Add prompts
     prompt_num = 0
     for i, conv in enumerate(conversations):
         if conv.get("is_continuation"):
-            continue
-        if conv["user_text"].startswith("Stop hook feedback:"):
             continue
         prompt_num += 1
         page_num = (i // PROMPTS_PER_PAGE) + 1
@@ -930,15 +984,7 @@ def generate_html(json_path, output_dir, github_repo=None):
         link = f"page-{page_num:03d}.html#{msg_id}"
         rendered_content = render_markdown_text(conv["user_text"])
 
-        # Collect all messages including from subsequent continuation conversations
-        # This ensures long_texts from continuations appear with the original prompt
         all_messages = list(conv["messages"])
-        for j in range(i + 1, len(conversations)):
-            if not conversations[j].get("is_continuation"):
-                break
-            all_messages.extend(conversations[j]["messages"])
-
-        # Analyze conversation for stats (excluding commits from inline display now)
         stats = analyze_conversation(all_messages)
         tool_stats_str = format_tool_stats(stats["tool_counts"])
 
@@ -954,14 +1000,10 @@ def generate_html(json_path, output_dir, github_repo=None):
         )
         timeline_items.append((conv["timestamp"], "prompt", item_html))
 
-    # Add commits as separate timeline items
     for commit_ts, commit_hash, commit_msg, page_num, conv_idx in all_commits:
-        item_html = _macros.index_commit(
-            commit_hash, commit_msg, commit_ts, _github_repo
-        )
+        item_html = _macros.index_commit(commit_hash, commit_msg, commit_ts, _github_repo)
         timeline_items.append((commit_ts, "commit", item_html))
 
-    # Sort by timestamp
     timeline_items.sort(key=lambda x: x[0])
     index_items = [item[2] for item in timeline_items]
 
@@ -986,9 +1028,9 @@ def generate_html(json_path, output_dir, github_repo=None):
 
 
 @click.group(cls=DefaultGroup, default="local", default_if_no_args=True)
-@click.version_option(None, "-v", "--version", package_name="claude-code-transcripts")
+@click.version_option(None, "-v", "--version", package_name="codex-transcripts")
 def cli():
-    """Convert Claude Code session JSON to mobile-friendly HTML pages."""
+    """Convert Codex session JSONL to mobile-friendly HTML pages."""
     pass
 
 
@@ -1007,7 +1049,7 @@ def cli():
 )
 @click.option(
     "--repo",
-    help="GitHub repo (owner/name) for commit links. Auto-detected from git push output if not specified.",
+    help="GitHub repo (owner/name) for commit links. Auto-detected from git output if not specified.",
 )
 @click.option(
     "--gist",
@@ -1032,31 +1074,29 @@ def cli():
     help="Maximum number of sessions to show (default: 10)",
 )
 def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit):
-    """Select and convert a local Claude Code session to HTML."""
+    """Select and convert a local Codex session to HTML."""
     from datetime import datetime
 
-    projects_folder = Path.home() / ".claude" / "projects"
+    sessions_folder = Path.home() / ".codex" / "sessions"
 
-    if not projects_folder.exists():
-        click.echo(f"Projects folder not found: {projects_folder}")
-        click.echo("No local Claude Code sessions available.")
+    if not sessions_folder.exists():
+        click.echo(f"Sessions folder not found: {sessions_folder}")
+        click.echo("No local Codex sessions available.")
         return
 
     click.echo("Loading local sessions...")
-    results = find_local_sessions(projects_folder, limit=limit)
+    results = find_local_sessions(sessions_folder, limit=limit)
 
     if not results:
         click.echo("No local sessions found.")
         return
 
-    # Build choices for questionary
     choices = []
     for filepath, summary in results:
         stat = filepath.stat()
         mod_time = datetime.fromtimestamp(stat.st_mtime)
         size_kb = stat.st_size / 1024
         date_str = mod_time.strftime("%Y-%m-%d %H:%M")
-        # Truncate summary if too long
         if len(summary) > 50:
             summary = summary[:47] + "..."
         display = f"{date_str}  {size_kb:5.0f} KB  {summary}"
@@ -1073,23 +1113,18 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
 
     session_file = selected
 
-    # Determine output directory and whether to open browser
-    # If no -o specified, use temp dir and open browser by default
     auto_open = output is None and not gist and not output_auto
     if output_auto:
-        # Use -o as parent dir (or current dir), with auto-named subdirectory
         parent_dir = Path(output) if output else Path(".")
         output = parent_dir / session_file.stem
     elif output is None:
-        output = Path(tempfile.gettempdir()) / f"claude-session-{session_file.stem}"
+        output = Path(tempfile.gettempdir()) / f"codex-session-{session_file.stem}"
 
     output = Path(output)
     generate_html(session_file, output, github_repo=repo)
 
-    # Show output directory
     click.echo(f"Output: {output.resolve()}")
 
-    # Copy JSONL file to output directory if requested
     if include_json:
         output.mkdir(exist_ok=True)
         json_dest = output / session_file.name
@@ -1098,7 +1133,6 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
         click.echo(f"JSONL: {json_dest} ({json_size_kb:.1f} KB)")
 
     if gist:
-        # Inject gist preview JS and create gist
         inject_gist_preview_js(output)
         click.echo("Creating GitHub gist...")
         gist_id, gist_url = create_gist(output)
@@ -1127,7 +1161,7 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
 )
 @click.option(
     "--repo",
-    help="GitHub repo (owner/name) for commit links. Auto-detected from git push output if not specified.",
+    help="GitHub repo (owner/name) for commit links. Auto-detected from git output if not specified.",
 )
 @click.option(
     "--gist",
@@ -1138,7 +1172,7 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
     "--json",
     "include_json",
     is_flag=True,
-    help="Include the original JSON session file in the output directory.",
+    help="Include the original JSONL session file in the output directory.",
 )
 @click.option(
     "--open",
@@ -1147,396 +1181,28 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
     help="Open the generated index.html in your default browser (default if no -o specified).",
 )
 def json_cmd(json_file, output, output_auto, repo, gist, include_json, open_browser):
-    """Convert a Claude Code session JSON/JSONL file to HTML."""
-    # Determine output directory and whether to open browser
-    # If no -o specified, use temp dir and open browser by default
+    """Convert a Codex session JSONL file to HTML."""
     auto_open = output is None and not gist and not output_auto
     if output_auto:
-        # Use -o as parent dir (or current dir), with auto-named subdirectory
         parent_dir = Path(output) if output else Path(".")
         output = parent_dir / Path(json_file).stem
     elif output is None:
-        output = Path(tempfile.gettempdir()) / f"claude-session-{Path(json_file).stem}"
+        output = Path(tempfile.gettempdir()) / f"codex-session-{Path(json_file).stem}"
 
     output = Path(output)
     generate_html(json_file, output, github_repo=repo)
 
-    # Show output directory
     click.echo(f"Output: {output.resolve()}")
 
-    # Copy JSON file to output directory if requested
     if include_json:
         output.mkdir(exist_ok=True)
         json_source = Path(json_file)
         json_dest = output / json_source.name
         shutil.copy(json_file, json_dest)
         json_size_kb = json_dest.stat().st_size / 1024
-        click.echo(f"JSON: {json_dest} ({json_size_kb:.1f} KB)")
+        click.echo(f"JSONL: {json_dest} ({json_size_kb:.1f} KB)")
 
     if gist:
-        # Inject gist preview JS and create gist
-        inject_gist_preview_js(output)
-        click.echo("Creating GitHub gist...")
-        gist_id, gist_url = create_gist(output)
-        preview_url = f"https://gistpreview.github.io/?{gist_id}/index.html"
-        click.echo(f"Gist: {gist_url}")
-        click.echo(f"Preview: {preview_url}")
-
-    if open_browser or auto_open:
-        index_url = (output / "index.html").resolve().as_uri()
-        webbrowser.open(index_url)
-
-
-def resolve_credentials(token, org_uuid):
-    """Resolve token and org_uuid from arguments or auto-detect.
-
-    Returns (token, org_uuid) tuple.
-    Raises click.ClickException if credentials cannot be resolved.
-    """
-    # Get token
-    if token is None:
-        token = get_access_token_from_keychain()
-        if token is None:
-            if platform.system() == "Darwin":
-                raise click.ClickException(
-                    "Could not retrieve access token from macOS keychain. "
-                    "Make sure you are logged into Claude Code, or provide --token."
-                )
-            else:
-                raise click.ClickException(
-                    "On non-macOS platforms, you must provide --token with your access token."
-                )
-
-    # Get org UUID
-    if org_uuid is None:
-        org_uuid = get_org_uuid_from_config()
-        if org_uuid is None:
-            raise click.ClickException(
-                "Could not find organization UUID in ~/.claude.json. "
-                "Provide --org-uuid with your organization UUID."
-            )
-
-    return token, org_uuid
-
-
-def format_session_for_display(session_data):
-    """Format a session for display in the list or picker.
-
-    Returns a formatted string.
-    """
-    session_id = session_data.get("id", "unknown")
-    title = session_data.get("title", "Untitled")
-    created_at = session_data.get("created_at", "")
-    # Truncate title if too long
-    if len(title) > 60:
-        title = title[:57] + "..."
-    return f"{session_id}  {created_at[:19] if created_at else 'N/A':19}  {title}"
-
-
-def generate_html_from_session_data(session_data, output_dir, github_repo=None):
-    """Generate HTML from session data dict (instead of file path)."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-
-    loglines = session_data.get("loglines", [])
-
-    # Auto-detect GitHub repo if not provided
-    if github_repo is None:
-        github_repo = detect_github_repo(loglines)
-        if github_repo:
-            click.echo(f"Auto-detected GitHub repo: {github_repo}")
-
-    # Set module-level variable for render functions
-    global _github_repo
-    _github_repo = github_repo
-
-    conversations = []
-    current_conv = None
-    for entry in loglines:
-        log_type = entry.get("type")
-        timestamp = entry.get("timestamp", "")
-        is_compact_summary = entry.get("isCompactSummary", False)
-        message_data = entry.get("message", {})
-        if not message_data:
-            continue
-        # Convert message dict to JSON string for compatibility with existing render functions
-        message_json = json.dumps(message_data)
-        is_user_prompt = False
-        user_text = None
-        if log_type == "user":
-            content = message_data.get("content", "")
-            if isinstance(content, str) and content.strip():
-                is_user_prompt = True
-                user_text = content
-        if is_user_prompt:
-            if current_conv:
-                conversations.append(current_conv)
-            current_conv = {
-                "user_text": user_text,
-                "timestamp": timestamp,
-                "messages": [(log_type, message_json, timestamp)],
-                "is_continuation": bool(is_compact_summary),
-            }
-        elif current_conv:
-            current_conv["messages"].append((log_type, message_json, timestamp))
-    if current_conv:
-        conversations.append(current_conv)
-
-    total_convs = len(conversations)
-    total_pages = (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE
-
-    for page_num in range(1, total_pages + 1):
-        start_idx = (page_num - 1) * PROMPTS_PER_PAGE
-        end_idx = min(start_idx + PROMPTS_PER_PAGE, total_convs)
-        page_convs = conversations[start_idx:end_idx]
-        messages_html = []
-        for conv in page_convs:
-            is_first = True
-            for log_type, message_json, timestamp in conv["messages"]:
-                msg_html = render_message(log_type, message_json, timestamp)
-                if msg_html:
-                    # Wrap continuation summaries in collapsed details
-                    if is_first and conv.get("is_continuation"):
-                        msg_html = f'<details class="continuation"><summary>Session continuation summary</summary>{msg_html}</details>'
-                    messages_html.append(msg_html)
-                is_first = False
-        pagination_html = generate_pagination_html(page_num, total_pages)
-        page_template = get_template("page.html")
-        page_content = page_template.render(
-            css=CSS,
-            js=JS,
-            page_num=page_num,
-            total_pages=total_pages,
-            pagination_html=pagination_html,
-            messages_html="".join(messages_html),
-        )
-        (output_dir / f"page-{page_num:03d}.html").write_text(
-            page_content, encoding="utf-8"
-        )
-        click.echo(f"Generated page-{page_num:03d}.html")
-
-    # Calculate overall stats and collect all commits for timeline
-    total_tool_counts = {}
-    total_messages = 0
-    all_commits = []  # (timestamp, hash, message, page_num, conv_index)
-    for i, conv in enumerate(conversations):
-        total_messages += len(conv["messages"])
-        stats = analyze_conversation(conv["messages"])
-        for tool, count in stats["tool_counts"].items():
-            total_tool_counts[tool] = total_tool_counts.get(tool, 0) + count
-        page_num = (i // PROMPTS_PER_PAGE) + 1
-        for commit_hash, commit_msg, commit_ts in stats["commits"]:
-            all_commits.append((commit_ts, commit_hash, commit_msg, page_num, i))
-    total_tool_calls = sum(total_tool_counts.values())
-    total_commits = len(all_commits)
-
-    # Build timeline items: prompts and commits merged by timestamp
-    timeline_items = []
-
-    # Add prompts
-    prompt_num = 0
-    for i, conv in enumerate(conversations):
-        if conv.get("is_continuation"):
-            continue
-        if conv["user_text"].startswith("Stop hook feedback:"):
-            continue
-        prompt_num += 1
-        page_num = (i // PROMPTS_PER_PAGE) + 1
-        msg_id = make_msg_id(conv["timestamp"])
-        link = f"page-{page_num:03d}.html#{msg_id}"
-        rendered_content = render_markdown_text(conv["user_text"])
-
-        # Collect all messages including from subsequent continuation conversations
-        # This ensures long_texts from continuations appear with the original prompt
-        all_messages = list(conv["messages"])
-        for j in range(i + 1, len(conversations)):
-            if not conversations[j].get("is_continuation"):
-                break
-            all_messages.extend(conversations[j]["messages"])
-
-        # Analyze conversation for stats (excluding commits from inline display now)
-        stats = analyze_conversation(all_messages)
-        tool_stats_str = format_tool_stats(stats["tool_counts"])
-
-        long_texts_html = ""
-        for lt in stats["long_texts"]:
-            rendered_lt = render_markdown_text(lt)
-            long_texts_html += _macros.index_long_text(rendered_lt)
-
-        stats_html = _macros.index_stats(tool_stats_str, long_texts_html)
-
-        item_html = _macros.index_item(
-            prompt_num, link, conv["timestamp"], rendered_content, stats_html
-        )
-        timeline_items.append((conv["timestamp"], "prompt", item_html))
-
-    # Add commits as separate timeline items
-    for commit_ts, commit_hash, commit_msg, page_num, conv_idx in all_commits:
-        item_html = _macros.index_commit(
-            commit_hash, commit_msg, commit_ts, _github_repo
-        )
-        timeline_items.append((commit_ts, "commit", item_html))
-
-    # Sort by timestamp
-    timeline_items.sort(key=lambda x: x[0])
-    index_items = [item[2] for item in timeline_items]
-
-    index_pagination = generate_index_pagination_html(total_pages)
-    index_template = get_template("index.html")
-    index_content = index_template.render(
-        css=CSS,
-        js=JS,
-        pagination_html=index_pagination,
-        prompt_num=prompt_num,
-        total_messages=total_messages,
-        total_tool_calls=total_tool_calls,
-        total_commits=total_commits,
-        total_pages=total_pages,
-        index_items_html="".join(index_items),
-    )
-    index_path = output_dir / "index.html"
-    index_path.write_text(index_content, encoding="utf-8")
-    click.echo(
-        f"Generated {index_path.resolve()} ({total_convs} prompts, {total_pages} pages)"
-    )
-
-
-@cli.command("web")
-@click.argument("session_id", required=False)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(),
-    help="Output directory. If not specified, writes to temp dir and opens in browser.",
-)
-@click.option(
-    "-a",
-    "--output-auto",
-    is_flag=True,
-    help="Auto-name output subdirectory based on session ID (uses -o as parent, or current dir).",
-)
-@click.option("--token", help="API access token (auto-detected from keychain on macOS)")
-@click.option(
-    "--org-uuid", help="Organization UUID (auto-detected from ~/.claude.json)"
-)
-@click.option(
-    "--repo",
-    help="GitHub repo (owner/name) for commit links. Auto-detected from git push output if not specified.",
-)
-@click.option(
-    "--gist",
-    is_flag=True,
-    help="Upload to GitHub Gist and output a gistpreview.github.io URL.",
-)
-@click.option(
-    "--json",
-    "include_json",
-    is_flag=True,
-    help="Include the JSON session data in the output directory.",
-)
-@click.option(
-    "--open",
-    "open_browser",
-    is_flag=True,
-    help="Open the generated index.html in your default browser (default if no -o specified).",
-)
-def web_cmd(
-    session_id,
-    output,
-    output_auto,
-    token,
-    org_uuid,
-    repo,
-    gist,
-    include_json,
-    open_browser,
-):
-    """Select and convert a web session from the Claude API to HTML.
-
-    If SESSION_ID is not provided, displays an interactive picker to select a session.
-    """
-    try:
-        token, org_uuid = resolve_credentials(token, org_uuid)
-    except click.ClickException:
-        raise
-
-    # If no session ID provided, show interactive picker
-    if session_id is None:
-        try:
-            sessions_data = fetch_sessions(token, org_uuid)
-        except httpx.HTTPStatusError as e:
-            raise click.ClickException(
-                f"API request failed: {e.response.status_code} {e.response.text}"
-            )
-        except httpx.RequestError as e:
-            raise click.ClickException(f"Network error: {e}")
-
-        sessions = sessions_data.get("data", [])
-        if not sessions:
-            raise click.ClickException("No sessions found.")
-
-        # Build choices for questionary
-        choices = []
-        for s in sessions:
-            sid = s.get("id", "unknown")
-            title = s.get("title", "Untitled")
-            created_at = s.get("created_at", "")
-            # Truncate title if too long
-            if len(title) > 50:
-                title = title[:47] + "..."
-            display = f"{created_at[:19] if created_at else 'N/A':19}  {title}"
-            choices.append(questionary.Choice(title=display, value=sid))
-
-        selected = questionary.select(
-            "Select a session to import:",
-            choices=choices,
-        ).ask()
-
-        if selected is None:
-            # User cancelled
-            raise click.ClickException("No session selected.")
-
-        session_id = selected
-
-    # Fetch the session
-    click.echo(f"Fetching session {session_id}...")
-    try:
-        session_data = fetch_session(token, org_uuid, session_id)
-    except httpx.HTTPStatusError as e:
-        raise click.ClickException(
-            f"API request failed: {e.response.status_code} {e.response.text}"
-        )
-    except httpx.RequestError as e:
-        raise click.ClickException(f"Network error: {e}")
-
-    # Determine output directory and whether to open browser
-    # If no -o specified, use temp dir and open browser by default
-    auto_open = output is None and not gist and not output_auto
-    if output_auto:
-        # Use -o as parent dir (or current dir), with auto-named subdirectory
-        parent_dir = Path(output) if output else Path(".")
-        output = parent_dir / session_id
-    elif output is None:
-        output = Path(tempfile.gettempdir()) / f"claude-session-{session_id}"
-
-    output = Path(output)
-    click.echo(f"Generating HTML in {output}/...")
-    generate_html_from_session_data(session_data, output, github_repo=repo)
-
-    # Show output directory
-    click.echo(f"Output: {output.resolve()}")
-
-    # Save JSON session data if requested
-    if include_json:
-        output.mkdir(exist_ok=True)
-        json_dest = output / f"{session_id}.json"
-        with open(json_dest, "w") as f:
-            json.dump(session_data, f, indent=2)
-        json_size_kb = json_dest.stat().st_size / 1024
-        click.echo(f"JSON: {json_dest} ({json_size_kb:.1f} KB)")
-
-    if gist:
-        # Inject gist preview JS and create gist
         inject_gist_preview_js(output)
         click.echo("Creating GitHub gist...")
         gist_id, gist_url = create_gist(output)

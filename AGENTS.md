@@ -4,9 +4,9 @@ Uses uv. Run tests like this:
 
 Run the development version of the tool like this:
 
-    uv run claude-code-transcripts --help
+    uv run codex-transcripts --help
 
-Always practice TDD: write a faliing test, watch it fail, then make it pass.
+Always practice TDD: write a failing test, watch it fail, then make it pass.
 
 Commit early and often. Commits should bundle the test, implementation, and documentation changes together.
 
